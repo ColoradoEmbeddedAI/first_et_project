@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "host",
+      "displayName": "Linux host (debug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TARGET_PLATFORM": "host",
+        "EXECUTORCH_BUILD_DIR": "$env{HOME}/executorch/executorch-build/host"
+      }
+    },
+    {
+      "name": "stm32",
+      "displayName": "STM32F407 (bare-metal Cortex-M4)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/stm32",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "MinSizeRel",
+        "TARGET_PLATFORM": "stm32",
+        "CMAKE_TOOLCHAIN_FILE": "$env{HOME}/executorch/executorch/cmake/toolchains/arm-none-eabi.cmake",
+        "EXECUTORCH_BUILD_DIR": "$env{HOME}/executorch/executorch-build/cortex-m4"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host"
+    },
+    {
+      "name": "stm32",
+      "configurePreset": "stm32"
+    }
+  ]
+}
