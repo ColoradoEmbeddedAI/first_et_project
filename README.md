@@ -80,22 +80,38 @@ deltas rather than copying its files over wholesale.
 
 ## 2. Export the Model
 
+This assumes you are in the first_et_project directory.
+
 ```bash
 source ~/executorch/et-env/bin/activate
-cd first_et_project
-python3 models/export_model.py
+python models/export_model.py
 ```
 
-Expected output:
+Expected output (on `stdout` — newer `torch`/`executorch` also print
+`FutureWarning` / deprecation notices to `stderr`; those are benign, add 
+`2>/dev/null` to the end of the `python models/export_model.py` command to hide them):
 ```
+Exporting model...
 Exported to: models/tiny_model.pte
 Model size:  1688 bytes
-Ops in exported graph:
+
+Ops in exported graph (use .out variants for SELECT_OPS_LIST):
   dim_order_ops._to_dim_order_copy.default
   aten.mul.Tensor
-  ...
+  aten.add.Tensor
+
+Running host sanity check...
+Input:    [[1.0, 2.0, 3.0, 4.0]]
+Output:   [[3.0, 5.0, 7.0, 9.0]]
+Expected: [[3.0, 5.0, 7.0, 9.0]]
 Sanity check PASSED
 ```
+
+Those three ops (the two `dim_order_ops._to_dim_order_copy` copies dedupe to
+one line) are exactly what `f(x) = x * 2 + 1` lowers to, and map to the `.out`
+variants in `EXECUTORCH_SELECT_OPS_LIST` — see
+[Gotcha 14](#gotcha-14-select_ops_list-uses-out-variants):
+`aten::mul.out,aten::add.out,dim_order_ops::_to_dim_order_copy.out`.
 
 The `.pte` file contains both the FlatBuffer program description and a
 constant segment with model weights/constants at the end of the file.
@@ -141,9 +157,15 @@ const unsigned int tiny_model_pte_len = ...;
 
 ## 3. Build and Test on Linux Host
 
+**Tip: validate on the host before building for STM32.** The host build
+uses the same runtime and kernels (in a Linux process instead of bare-metal)
+and is much faster to iterate on.
+
+
+The below assumes you are currently in the first_et_project directory.  Note: activating a virtual environment if you're already in one doesn't do any harm, but you can skip.
+
 ```bash
 source ~/executorch/et-env/bin/activate
-cd first_et_project
 
 cmake --preset host
 cmake --build --preset host
@@ -159,9 +181,18 @@ Expected: 3.0 5.0 7.0 9.0
 PASS
 ```
 
-**Always validate on the host before building for STM32.** The host build
-uses the same runtime and kernels (in a Linux process instead of bare-metal)
-and is much faster to iterate on.
+
+> **macOS note.** `CMakeLists.txt` handles two toolchain differences for the
+> `host` preset automatically:
+> - **C++17** — ExecuTorch headers need it (`std::variant`, `is_same_v`,
+>   `constexpr if`). Linux GCC defaults to `gnu++17`; Apple Clang does not, so
+>   the `inference_host` target now passes `-std=c++17` explicitly. Symptom
+>   without it: `error: "You need C++17 to compile ExecuTorch"`.
+> - **Force-loading the kernels archive** ([Gotcha 9](#gotcha-9---whole-archive-required-for-op-registration)) —
+>   GNU `ld` uses `-Wl,--whole-archive`; Apple's `ld64` rejects that flag
+>   (`ld: unknown options: --whole-archive`) and uses
+>   `-Wl,-force_load,<archive>` instead. The build picks the right one via
+>   `if(APPLE)`.
 
 ---
 
@@ -199,6 +230,21 @@ and
 
 ### Flash with OpenOCD
 
+This writes the firmware to the chip and lets it run **standalone, with no
+debugger attached**. OpenOCD connects to the on-board ST-LINK probe over USB,
+`program` erases and writes `firmware.bin` into flash starting at
+`0x08000000` (the base of flash, where the vector table must live), `verify`
+reads it back to confirm the write, and `reset exit` resets the MCU so it
+begins executing from the reset vector, then closes OpenOCD.
+
+**Note:** This firmware has **no UART / serial output** — it is
+not like the `first_embedded` UART examples. `src/main.cpp` runs inference,
+stores the outputs in `volatile` variables (`correct`, `results`), and spins
+in `while(1)`.  The only
+way to observe the result is to attach GDB and inspect those variables — see
+[Debug with GDB](#debug-with-gdb) below. Doing the step here, is unnecessary, but useful as a quick "does it boot without faulting" check, and for leaving
+a known-good image on the board.
+
 ```bash
 openocd \
   -f interface/stlink.cfg \
@@ -206,7 +252,23 @@ openocd \
   -c "program build/stm32/firmware.bin 0x08000000 verify reset exit"
 ```
 
+**Checking the result.** This firmware has **no UART / serial output** — it is
+not like the `first_embedded` UART examples. `src/main.cpp` runs inference,
+stores the outputs in `volatile` variables (`correct`, `results`), and spins
+in `while(1)`. Running `picocom` against the USB-UART adapter after the flash
+above will show nothing, because nothing is ever written to a UART. The only
+way to observe the result is to attach GDB and inspect those variables — see
+[Debug with GDB](#debug-with-gdb) below. (The `program … reset exit` flash is
+still useful as a quick "does it boot without faulting" check, and for leaving
+a known-good image on the board.)
+
+** Optional Exercise: add  USART2 init + a write
+routine to `main.cpp` (adapt the `uart-tx` example in `../first_embedded`),
+rebuild, reflash, then see the result in picocom.
+
 ### Debug with GDB
+
+The below assumes you are in the first_et_project directory.
 
 Inference results land in `volatile` variables (`correct`, `results`) that
 are inspected at the final `while(1)` in `src/main.cpp`.
@@ -218,7 +280,10 @@ openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
 
 **Terminal 2** — connect GDB and inspect the results:
 ```bash
+# Linux
 gdb-multiarch build/stm32/firmware.elf
+# MacOS
+arm-none-eabi-gdb build/stm32/firmware.elf
 ```
 ```
 (gdb) target remote :3333
@@ -569,6 +634,12 @@ target_link_libraries(firmware.elf PRIVATE
 Only `executorch_selected_kernels` needs `--whole-archive`. Putting
 `portable_kernels` (148MB) under `--whole-archive` causes a 10MB+ binary that
 exceeds flash capacity.
+
+The `stm32` build always uses GNU `ld` (via `arm-none-eabi-gcc`), so it uses
+`--whole-archive` unconditionally. The `host` build on **macOS** links with
+Apple's `ld64`, which rejects `--whole-archive`; there `CMakeLists.txt`
+substitutes `-Wl,-force_load,$<TARGET_FILE:executorch_selected_kernels>`
+under an `if(APPLE)` branch.
 
 ---
 

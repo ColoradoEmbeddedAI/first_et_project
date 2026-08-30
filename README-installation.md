@@ -1,9 +1,14 @@
 # Installation Guide — ExecuTorch Toolchain Setup
 
 This document covers **one-time environment setup**: installing prerequisites,
-cloning and building ExecuTorch for both the Linux host and the Cortex-M4
-target. It is shared across any project in this repo that uses ExecuTorch —
-you only need to do this once, then reuse the build for multiple projects.
+cloning and building ExecuTorch for both the host (Linux or macOS) and the
+Cortex-M4 target. It is shared across any project in this repo that uses
+ExecuTorch — you only need to do this once, then reuse the build for multiple
+projects.
+
+Both **Ubuntu 24.04** and **macOS** (13 Ventura or newer, Apple Silicon or
+Intel) are supported. Where a step differs, platform-specific blocks are
+labelled **Linux** and **macOS**; unlabelled steps are identical on both.
 
 For project-specific usage (exporting the model, building/running
 `first_et_project` itself), see [README.md](README.md).
@@ -22,7 +27,29 @@ For project-specific usage (exporting the model, building/running
 
 ## 1. Prerequisites
 
+### Already set up `first_embedded`?
+
+If you have already successfully built and tested
+[ColoradoEmbeddedAI/first_embedded](https://github.com/ColoradoEmbeddedAI/first_embedded)
+on this machine, most of this section is done:
+
+- **Ubuntu 24.04:** nothing to do — the ARM toolchain, `openocd`, `cmake`,
+  `ninja`, and a compatible Python 3 are all already installed. Skip to
+  [Section 2](#2-clone-executorch).
+- **macOS:** you only need the Python that ExecuTorch requires:
+
+  ```bash
+  brew install python@3.12
+  ```
+
+  Then skip to [Section 2](#2-clone-executorch).
+
+If you have **not** done `first_embedded` (or the build failed), follow the
+full package list below.
+
 ### System packages
+
+#### Linux (Ubuntu 24.04)
 
 ```bash
 sudo apt update
@@ -42,10 +69,42 @@ sudo apt install -y \
 Note: Python < 3.13 is required for ExecuTorch. Ubuntu 24.04 defaults to a
 compatible version; Ubuntu 26.04 might not.
 
-Verify the ARM toolchain:
+#### macOS
+
+Install the Xcode Command Line Tools (provides `git`, `make`, `clang`, `xxd`)
+and [Homebrew](https://brew.sh), then the build tools and ARM toolchain:
 
 ```bash
-arm-none-eabi-gcc --version   # should show 13.x
+xcode-select --install
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+brew install cmake ninja python@3.12
+brew install --cask gcc-arm-embedded      # arm-none-eabi-gcc/g++/gdb + binutils
+brew install open-ocd
+```
+
+macOS notes:
+
+- **Python < 3.13 is required for ExecuTorch.** Homebrew's `python` may be
+  3.13+, so create the venv with `python3.12` explicitly (see
+  [Section 3](#3-build-executorch-for-python)).
+- **No `gdb-multiarch` on macOS.** `arm-none-eabi-gdb` (bundled with the
+  `gcc-arm-embedded` cask) is the equivalent — substitute it wherever
+  [README.md](README.md) says `gdb-multiarch`. On Apple Silicon, `gdb` itself
+  is unreliable; you can also debug with the bundled `lldb` attached to
+  OpenOCD's gdb server.
+- If the `gcc-arm-embedded` cask is blocked by Gatekeeper, run
+  `xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/gcc-arm-embedded"`,
+  or install the Arm GNU Toolchain manually from Arm's site.
+- **`nproc` does not exist on macOS.** Each `cmake --build … -j$(nproc)`
+  command below is followed by a commented-out `# macOS` line using
+  `-j$(sysctl -n hw.logicalcpu)` — run that one instead (plain `-j` also
+  works).
+
+### Verify the ARM toolchain
+
+```bash
+arm-none-eabi-gcc --version   # should show 13.x or newer
 openocd --version             # should show 0.12.x
 ```
 
@@ -62,7 +121,7 @@ openocd --version             # should show 0.12.x
 ├── executorch/                  # ExecuTorch source (git clone)
 ├── et-env/                      # Python virtual environment
 └── executorch-build/
-    ├── host/                    # ExecuTorch built for Linux
+    ├── host/                    # ExecuTorch built for the host (Linux/macOS)
     └── cortex-m4/               # ExecuTorch built for STM32
 ```
 
@@ -98,9 +157,12 @@ not currently take into account...". This is expected and can be ignored.
 
 ```bash
 cd ~/executorch
-python3 -m venv et-env
+python3 -m venv et-env        # Linux
+# python3.12 -m venv et-env.  # MacOS
 source et-env/bin/activate
+python --version              # confirm 3.12.x
 ```
+
 
 When the venv is active, your prompt is prefixed with its name, e.g.:
 
@@ -127,6 +189,10 @@ pip install torch torchvision torchaudio \
 pip install executorch
 ```
 
+On **macOS** the PyTorch wheels are always CPU/MPS (no CUDA variant exists),
+so the `--index-url` is optional — plain
+`pip install torch torchvision torchaudio` works too.
+
 ### Build the ExecuTorch Python package
 
 ```bash
@@ -141,7 +207,55 @@ source ~/executorch/et-env/bin/activate
 hash -r
 ```
 
-### Build the ExecuTorch runtime for the Linux host
+#### If it Errors on macOS: patch the bundled `flatcc` first, then rerun install_executorch.sh
+
+On recent macOS + Xcode (tested on macOS 15/26 with Apple Clang 17), the
+vendored `flatcc` library in `release/1.2` fails to build:
+
+```
+flatcc/portable/pprintint.h:388:13: error: implicit conversion loses integer
+  precision ... [-Werror,-Wimplicit-int-conversion-on-negation]
+grisu3_print.h:186:33: error: initializer-string for character array is too
+  long ... [-Werror,-Wunterminated-string-initialization]
+make[6]: *** [.../flatccrt.dir/json_printer.c.o] Error 1
+```
+
+`install_executorch.sh` then aborts with
+`Failed building wheel for executorch`. Newer Clang promotes two warnings to
+errors and `flatcc`'s build sets `-Werror`. Disable it in **both** places
+ExecuTorch builds `flatcc`, by editing
+`~/executorch/executorch/third-party/CMakeLists.txt`:
+
+```cmake
+# 1. In the ExternalProject_Add(flatcc_ep ...) CMAKE_ARGS list, add one line:
+# (note teh first two lines are for reference to find where to add the needed line)
+  CMAKE_ARGS -DFLATCC_RTONLY=OFF
+             -DFLATCC_TEST=OFF
+             -DFLATCC_ALLOW_WERROR=OFF          # <-- add this
+             ...
+
+# 2. Next to the other set(FLATCC_* ... CACHE BOOL "") lines just before
+#    add_subdirectory(flatcc), add:
+set(FLATCC_ALLOW_WERROR OFF CACHE BOOL "")      # <-- add this
+```
+
+Then run `./install_executorch.sh` (Linux users skip straight to it).
+
+> This edits vendored third-party code. `git submodule update` in the
+> ExecuTorch tree will revert it — re-apply if that happens. Upstream
+> `flatcc` has since fixed this, so a newer ExecuTorch release would not
+> need the patch.
+
+If `pip install executorch` above pulled a newer wheel (e.g. `1.4.1`) than
+the `release/1.2` source, `install_executorch.sh` replaces it with the
+source build (`1.2.0a0`) once it succeeds. Confirm afterwards:
+
+```bash
+pip show executorch | grep Version          # expect 1.2.0a0
+python -c "from executorch.extension.pybindings import portable_lib"  # no error
+```
+
+### Build the ExecuTorch runtime for the host (Linux/macOS)
 
 ```bash
 source ~/executorch/et-env/bin/activate
@@ -151,16 +265,51 @@ cmake -S ~/executorch/executorch -B ~/executorch/executorch-build/host \
   -DEXECUTORCH_BUILD_EXECUTOR_RUNNER=OFF \
   -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
   -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON \
-  -DEXECUTORCH_BUILD_KERNELS_PORTABLE=ON \
+  -DEXECUTORCH_BUILD_PORTABLE_OPS=ON \
   -DEXECUTORCH_BUILD_XNNPACK=OFF \
   -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=OFF \
   -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=OFF \
   -DEXECUTORCH_SELECT_OPS_LIST="aten::mul.out,aten::add.out,dim_order_ops::_to_dim_order_copy.out"
 
-cmake --build ~/executorch/executorch-build/host -j$(nproc)
+cmake --build ~/executorch/executorch-build/host -j$(nproc)                       # Linux
+# cmake --build ~/executorch/executorch-build/host -j$(sysctl -n hw.logicalcpu)   # macOS
 ```
 
-This takes 15–30 minutes on first run (code generation is slow).
+The two commands are separate steps:
+
+- `cmake -S … -B …` is only the **configure** step — it finishes in seconds
+  to a minute and writes build files. Re-running it is near-instant.
+- `cmake --build …` is the **compile** step — this is the one that takes
+  15–30 minutes on first run (code generation is slow).
+
+`nproc` is Linux-only; the commented `# macOS` line under each
+`cmake --build` uses `sysctl -n hw.logicalcpu` instead. Plain `-j` (no count)
+also works on either platform.
+
+#### Harmless "Manually-specified variables were not used" warning
+
+The configure step may end with, e.g.:
+
+```
+CMake Warning:
+  Manually-specified variables were not used by the project:
+    EXECUTORCH_BUILD_KERNELS_PORTABLE
+```
+
+This just means a `-D…` flag didn't match an option this ExecuTorch version
+defines — usually a flag that was renamed or is only defined when some other
+feature is enabled. It is safe to ignore as long as the underlying default
+already matches the intent. In `release/1.2` the portable-kernels option is
+`EXECUTORCH_BUILD_PORTABLE_OPS` (default `ON`), which is why the commands
+above use that name. Confirm the build was configured correctly with:
+
+```bash
+cmake -LA -N ~/executorch/executorch-build/host | grep -E \
+  'EXECUTORCH_BUILD_PORTABLE_OPS|EXECUTORCH_SELECT_OPS_LIST'
+# Expected output includes:
+# EXECUTORCH_BUILD_PORTABLE_OPS:BOOL=ON
+# EXECUTORCH_SELECT_OPS_LIST:STRING=aten::mul.out,aten::add.out,dim_order_ops::_to_dim_order_copy.out
+```
 
 The `EXECUTORCH_SELECT_OPS_LIST` flag lists the ops needed by this project's
 model. See [Section 5](#5-rebuilding-after-changing-the-op-set) if your model
@@ -173,7 +322,7 @@ needs different ops.
 ### Create the ARM toolchain file
 
 ExecuTorch's release/1.2 branch does not ship a Cortex-M4 toolchain file.
-Create it manually:
+Create it manually.  Note: replace /path/to/first_et_project with the path where the cloned repo [ColoradoEmbeddedAI/first_et_project](https://github.com/ColoradoEmbeddedAI/first_et_project) resides locally:
 
 ```bash
 mkdir -p ~/executorch/executorch/cmake/toolchains
@@ -208,7 +357,7 @@ cmake -S ~/executorch/executorch -B ~/executorch/executorch-build/cortex-m4 \
   -DEXECUTORCH_BUILD_EXECUTOR_RUNNER=OFF \
   -DEXECUTORCH_BUILD_HOST_TARGETS=OFF \
   -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
-  -DEXECUTORCH_BUILD_KERNELS_PORTABLE=ON \
+  -DEXECUTORCH_BUILD_PORTABLE_OPS=ON \
   -DEXECUTORCH_SELECT_OPS_LIST="aten::mul.out,aten::add.out,dim_order_ops::_to_dim_order_copy.out" \
   -DEXECUTORCH_BUILD_XNNPACK=OFF \
   -DEXECUTORCH_XNNPACK_ENABLE_KLEIDI=OFF \
@@ -222,11 +371,18 @@ cmake -S ~/executorch/executorch -B ~/executorch/executorch-build/cortex-m4 \
   -DEXECUTORCH_BUILD_EXTENSION_THREADPOOL=OFF \
   -DEXECUTORCH_BUILD_EXTENSION_RUNNER_UTIL=OFF
 
-cmake --build ~/executorch/executorch-build/cortex-m4 -j$(nproc)
+# Linux
+cmake --build ~/executorch/executorch-build/cortex-m4 -j$(nproc) 
+# MacOS
+cmake --build ~/executorch/executorch-build/cortex-m4 -j$(sysctl -n hw.logicalcpu)   
 
 # Build the selective kernels library (smaller than full portable_ops_lib)
+# Linux
 cmake --build ~/executorch/executorch-build/cortex-m4 \
-  --target executorch_selected_kernels -j$(nproc)
+  --target executorch_selected_kernels -j$(nproc)               
+# MacOS
+ cmake --build ~/executorch/executorch-build/cortex-m4 \
+   --target executorch_selected_kernels -j$(sysctl -n hw.logicalcpu)    
 ```
 
 ### Flag reference
@@ -286,6 +442,8 @@ configure, not just a rebuild.
 
 ```bash
 source ~/executorch/et-env/bin/activate
+
+# -j$(nproc) below is Linux; on macOS use -j$(sysctl -n hw.logicalcpu) or plain -j
 
 # 1. Re-configure and rebuild the host tree with the new op list
 cmake -S ~/executorch/executorch -B ~/executorch/executorch-build/host \

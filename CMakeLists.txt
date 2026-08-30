@@ -76,23 +76,39 @@ if(TARGET_PLATFORM STREQUAL "host")
         src/main_host.cpp
     )
 
+    # ExecuTorch headers require C++17 (std::variant, is_same_v, constexpr if).
+    # Linux GCC defaults to gnu++17, but Apple Clang from the macOS Command
+    # Line Tools still defaults to an older standard, so set it explicitly.
     target_compile_options(inference_host PRIVATE
-        -Wall -Wextra -g -Og
+        -std=c++17 -Wall -Wextra -g -Og
     )
 
     target_include_directories(inference_host PRIVATE
         ${ET_INCLUDES}
     )
 
-    # --whole-archive is required for portable_ops_lib / selected_kernels
-    # because op registration happens via static initializers (global
-    # constructors). Without --whole-archive the linker discards object
-    # files with no directly referenced symbols, and the registration
-    # code is never linked in, causing OperatorMissing at runtime.
+    # The whole selected-kernels archive must be pulled in because op
+    # registration happens via static initializers (global constructors).
+    # Otherwise the linker discards object files with no directly referenced
+    # symbols, the registration code is never linked, and inference fails
+    # with OperatorMissing at runtime.
+    #
+    # GNU ld spells this --whole-archive/--no-whole-archive around the lib;
+    # Apple's ld64 (macOS) has no such flag and instead takes -force_load
+    # with the archive path, which we get from the imported target.
+    if(APPLE)
+        target_link_libraries(inference_host PRIVATE
+            -Wl,-force_load,$<TARGET_FILE:executorch_selected_kernels>
+        )
+    else()
+        target_link_libraries(inference_host PRIVATE
+            -Wl,--whole-archive
+            executorch_selected_kernels
+            -Wl,--no-whole-archive
+        )
+    endif()
+
     target_link_libraries(inference_host PRIVATE
-        -Wl,--whole-archive
-        executorch_selected_kernels
-        -Wl,--no-whole-archive
         portable_kernels
         executorch
         executorch_core

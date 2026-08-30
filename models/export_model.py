@@ -56,11 +56,17 @@ def main():
     print(f"Exported to: {output_path}")
     print(f"Model size:  {len(et_program.buffer)} bytes")
 
-    # Print ops used — useful for setting EXECUTORCH_SELECT_OPS_LIST
+    # Print ops used — useful for setting EXECUTORCH_SELECT_OPS_LIST.
+    # node.target is an EdgeOpOverload; its repr is verbose ("<EdgeOpOverload:
+    # ...>: schema = ..."), so use __name__ for the bare dotted op name.
     print("\nOps in exported graph (use .out variants for SELECT_OPS_LIST):")
+    seen = set()
     for node in exir.to_edge(ep).exported_program().graph.nodes:
         if node.op == 'call_function':
-            print(f"  {node.target}")
+            name = getattr(node.target, '__name__', str(node.target))
+            if name not in seen:
+                seen.add(name)
+                print(f"  {name}")
 
     # Quick sanity check on the host
     print("\nRunning host sanity check...")
