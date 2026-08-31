@@ -359,6 +359,7 @@ cmake -S ~/executorch/executorch -B ~/executorch/executorch-build/cortex-m4 \
   -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
   -DEXECUTORCH_BUILD_PORTABLE_OPS=ON \
   -DEXECUTORCH_SELECT_OPS_LIST="aten::mul.out,aten::add.out,dim_order_ops::_to_dim_order_copy.out" \
+  -DMAX_KERNEL_NUM=128 \
   -DEXECUTORCH_BUILD_XNNPACK=OFF \
   -DEXECUTORCH_XNNPACK_ENABLE_KLEIDI=OFF \
   -DEXECUTORCH_XNNPACK_SHARED_WORKSPACE=OFF \
@@ -423,6 +424,26 @@ affects `executorch_selected_kernels`. Always build and link
 `executorch_selected_kernels` (not `portable_ops_lib`) for size-constrained
 targets — the full `portable_ops_lib` with all ops exceeds 10MB and won't fit
 in 1MB flash.
+
+**About `MAX_KERNEL_NUM`:** ExecuTorch's operator registry
+(`runtime/kernel/operator_registry.cpp`) reserves a fixed-size table for
+registered kernels — `250 operators * 8 kernels/op = 2000` slots by default,
+which costs real `.bss` on a Cortex-M4. `-DMAX_KERNEL_NUM=128` shrinks that
+table to fit this project's tiny op list, saving RAM. **This flag only
+belongs on the `cortex-m4` configure command, never on `host`'s.** The `host`
+build whole-archives `portable_ops_lib`, which registers *every* portable op
+unconditionally (~200+), regardless of `EXECUTORCH_SELECT_OPS_LIST` — capping
+the table at 128 there makes registration overflow and hard-abort before
+`main()` ever runs its inference.
+
+Do **not** "fix" this by hand-editing the `kMaxOperators` constant in
+`operator_registry.cpp` itself. That file is shared source
+compiled into *every* ExecuTorch build tree on this machine (`host`,
+`cortex-m4`, and anyone else's) — patching it directly silently breaks every
+other tree's host-side inference the next time it's rebuilt, with no record
+of why. `MAX_KERNEL_NUM` exists precisely so this can be scoped per build
+tree via CMake instead; always use it as a `-D` flag on the specific
+`cmake -S ... -B ...` configure command that needs it.
 
 **`$HOME` vs `~`:** CMake does not expand `~` in `-D` arguments — it's shell
 shorthand, and CMake receives it literally, producing errors like
